@@ -706,13 +706,107 @@ npm install ai @ai-sdk/anthropic @anthropic-ai/sdk \
 }</code></pre>
     </div>
 
+    <h3>Step 2 — Create the database module</h3>
+
+    <p>
+      The singleton pattern for the Postgres pool is important. In development, Next.js hot-reloads
+      your server code on every change. Without a singleton, each reload creates a new pool and you'll
+      exhaust Postgres's connection limit quickly. We store the pool on the <code>global</code> object
+      so it survives module re-evaluation.
+    </p>
+
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-lang"><span class="code-dot"></span>typescript</div>
+        <span>src/lib/db.ts</span>
+      </div>
+      <pre><code><span class="kw">import</span> { <span class="imp">Pool</span> } <span class="kw">from</span> <span class="str">'pg'</span>
+
+<span class="cm">// Declare a global type so TypeScript doesn't complain about
+// attaching things to the global object</span>
+<span class="kw">declare global</span> {
+  <span class="kw">var</span> __pgPool: <span class="imp">Pool</span> | <span class="kw">undefined</span>
+}
+
+<span class="cm">// Reuse the pool in dev (hot-reload safe), create fresh in prod</span>
+<span class="kw">export const</span> pool: <span class="imp">Pool</span> =
+  global.__pgPool ??
+  (global.__pgPool = <span class="kw">new</span> <span class="imp">Pool</span>({
+    connectionString: process.env.<span class="imp">DATABASE_URL</span>,
+    max: <span class="num">10</span>,                <span class="cm">// max concurrent connections</span>
+    idleTimeoutMillis: <span class="num">30000</span>,
+    connectionTimeoutMillis: <span class="num">5000</span>,
+  }))
+
+<span class="cm">// Typed result row</span>
+<span class="kw">export interface</span> <span class="imp">Job</span> {
+  id: <span class="imp">number</span>
+  title: <span class="imp">string</span>
+  company: <span class="imp">string</span>
+  description: <span class="imp">string</span>
+  skills: <span class="imp">string</span>[]
+  created_at: <span class="imp">Date</span>
+}
+
+<span class="kw">export async function</span> <span class="fn">getRecentJobs</span>(limit: <span class="imp">number</span>): <span class="kw">Promise</span>&lt;<span class="imp">Job</span>[]&gt; {
+  <span class="kw">const</span> { rows } = <span class="kw">await</span> pool.<span class="fn">query</span>&lt;<span class="imp">Job</span>&gt;(
+    <span class="str">'SELECT id, title, company, description, skills, created_at FROM jobs ORDER BY created_at DESC LIMIT $1'</span>,
+    [limit]
+  )
+  <span class="kw">return</span> rows
+}
+
+<span class="cm">// Health check — useful for k8s liveness probes</span>
+<span class="kw">export async function</span> <span class="fn">dbHealthCheck</span>(): <span class="kw">Promise</span>&lt;<span class="kw">boolean</span>&gt; {
+  <span class="kw">try</span> {
+    <span class="kw">await</span> pool.<span class="fn">query</span>(<span class="str">'SELECT 1'</span>)
+    <span class="kw">return</span> <span class="kw">true</span>
+  } <span class="kw">catch</span> {
+    <span class="kw">return</span> <span class="kw">false</span>
+  }
+}</code></pre>
+    </div>
+
+    <h3>Step 3 — Add a health check route</h3>
+
+    <p>
+      Both Docker and Kubernetes will probe this endpoint to decide if the container is healthy.
+      Create it now so you don't have to revisit later.
+    </p>
+
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-lang"><span class="code-dot"></span>typescript</div>
+        <span>src/app/api/health/route.ts</span>
+      </div>
+      <pre><code><span class="kw">import</span> { <span class="fn">dbHealthCheck</span> } <span class="kw">from</span> <span class="str">'@/lib/db'</span>
+
+<span class="kw">export async function</span> <span class="fn">GET</span>() {
+  <span class="kw">const</span> dbOk = <span class="kw">await</span> <span class="fn">dbHealthCheck</span>()
+  <span class="kw">const</span> status = dbOk ? <span class="num">200</span> : <span class="num">503</span>
+  <span class="kw">return</span> <span class="imp">Response</span>.<span class="fn">json</span>({ status: dbOk ? <span class="str">'ok'</span> : <span class="str">'degraded'</span>, db: dbOk }, { status })
+}</code></pre>
+    </div>
+
+    <div class="callout tip">
+      <span class="callout-icon">✦</span>
+      <div class="callout-body">
+        <p>
+          Run <code>curl http://localhost:3000/api/health</code> at any point to confirm your
+          database connection is alive. A <code>{"status":"ok","db":true}</code> response means
+          everything is wired up correctly.
+        </p>
+      </div>
+    </div>
+
     <div class="claude-prompt">
       <div class="claude-prompt-header">Claude Code Prompt</div>
       <p>
-        Create src/lib/db.ts that exports a singleton Postgres pool using the pg package 
-        and DATABASE_URL env var. Also create a getRecentJobs(limit: number) function that 
-        queries a jobs table returning id, title, company, description, created_at. 
-        Include the SQL to create the jobs table as a comment at the top.
+        Create src/lib/db.ts with the singleton Pool pattern above. Then add two more
+        query functions: getJobById(id: number) that returns a single Job or null, and
+        searchJobsBySkill(skill: string) that does a Postgres text search on the skills
+        array column using the &amp;&amp; (overlap) operator. Add proper TypeScript return types
+        for both. Also create src/app/api/health/route.ts as shown.
       </p>
     </div>
 
@@ -970,13 +1064,72 @@ server.<span class="fn">tool</span>(
 }</code></pre>
     </div>
 
+    <h3>Step 3 — Test the MCP server in isolation</h3>
+
+    <p>
+      Before wiring the MCP server into Next.js, test it on its own using the
+      <code>@modelcontextprotocol/inspector</code> tool. This saves a lot of debugging time —
+      you'll know whether a bug lives in the MCP server or the AI SDK bridge.
+    </p>
+
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-lang"><span class="code-dot"></span>bash</div>
+        <span>terminal — test MCP server standalone</span>
+      </div>
+      <pre><code><span class="cm"># Install the MCP inspector (opens a browser UI)</span>
+npx @modelcontextprotocol/inspector tsx src/mcp-server/index.ts
+
+<span class="cm"># This opens http://localhost:5173 where you can:
+# - See all tools the server exposes
+# - Call search_jobs with a query and see the raw result
+# - Verify analyze_skill_gap returns the right shape
+# - Spot any runtime errors before involving Claude at all</span>
+
+<span class="cm"># Alternatively, test via raw JSON-RPC on stdin:</span>
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | npx tsx src/mcp-server/index.ts</code></pre>
+    </div>
+
+    <div class="callout info">
+      <span class="callout-icon">ℹ</span>
+      <div class="callout-body">
+        <p>
+          The MCP inspector is the equivalent of Postman for MCP servers. Use it to verify
+          your tool schemas, test edge cases, and confirm the JSON your tools return is
+          parseable — before spending tokens having Claude call them repeatedly.
+        </p>
+      </div>
+    </div>
+
+    <h3>Step 4 — Add to package.json scripts</h3>
+
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-lang"><span class="code-dot"></span>json</div>
+        <span>package.json (scripts section)</span>
+      </div>
+      <pre><code>{
+  <span class="key">"scripts"</span>: {
+    <span class="key">"dev"</span>: <span class="str">"next dev"</span>,
+    <span class="key">"build"</span>: <span class="str">"next build"</span>,
+    <span class="key">"start"</span>: <span class="str">"next start"</span>,
+    <span class="key">"mcp:dev"</span>: <span class="str">"npx tsx src/mcp-server/index.ts"</span>,
+    <span class="key">"mcp:inspect"</span>: <span class="str">"npx @modelcontextprotocol/inspector tsx src/mcp-server/index.ts"</span>,
+    <span class="key">"db:migrate"</span>: <span class="str">"psql $DATABASE_URL -f migrations/001_init.sql"</span>,
+    <span class="key">"db:seed"</span>: <span class="str">"npx tsx scripts/seed.ts"</span>
+  }
+}</code></pre>
+    </div>
+
     <div class="claude-prompt">
       <div class="claude-prompt-header">Claude Code Prompt</div>
       <p>
-        Add a third tool to the MCP server called "get_trending_skills". It should query 
-        the jobs table, unnest the skills array column, count occurrences of each skill, 
-        and return the top N skills sorted by frequency. Accept a limit parameter defaulting 
-        to 10. Return results as JSON with {skill, count, percentage} fields.
+        Add a third tool to the MCP server called "get_trending_skills". It should query
+        the jobs table, unnest the skills array column, count occurrences of each skill,
+        and return the top N skills sorted by frequency. Accept a limit parameter defaulting
+        to 10. Return results as JSON with an array of {skill, count, percentage} objects
+        where percentage is that skill's share of all job postings. Run npm run mcp:inspect
+        after and verify the tool appears and returns data correctly.
       </p>
     </div>
 
@@ -990,15 +1143,62 @@ server.<span class="fn">tool</span>(
       <span class="section-num amber">04</span>
       <h2>Vercel AI SDK — Streaming Chat</h2>
     </div>
-    <div class="phase-badge">Phase 4 · ~1 hour</div>
+    <div class="phase-badge">Phase 4 · ~1.5 hours</div>
 
     <p>
-      The <strong>Vercel AI SDK</strong> provides framework-agnostic helpers for streaming LLM 
-      output. It handles the streaming protocol, tool call round-trips, and React hooks so you 
-      don't have to wire up SSE manually.
+      The <strong>Vercel AI SDK</strong> is a TypeScript library that handles the gnarly parts of working
+      with LLMs: streaming responses over HTTP, multi-step tool-call loops, React state management,
+      and error recovery. Without it you'd hand-roll Server-Sent Events, parse partial JSON deltas,
+      and manage the tool-call ↔ tool-result message interleaving yourself. The SDK does all of that.
     </p>
 
-    <h3>The Route Handler (server-side)</h3>
+    <p>
+      The SDK has two layers. The <strong>core</strong> (<code>ai</code> package) is framework-agnostic
+      — it works in any Node.js server. The <strong>React layer</strong> (<code>ai/react</code>) adds
+      hooks like <code>useChat</code> that wire streaming responses directly into component state.
+    </p>
+
+    <h3>How streaming works end-to-end</h3>
+
+    <p>
+      Understanding the data flow will save you hours of debugging. Here's what happens when the user
+      sends a message:
+    </p>
+
+    <div class="arch">
+<span class="ah">1. useChat</span> serialises messages → POST /api/chat (JSON body)
+
+<span class="ag">2. Route handler</span> calls streamText() → opens connection to Claude API
+
+<span class="acc">3. Claude</span> may respond with text, OR decide to call a tool first
+
+   If tool call:
+   <span class="ap">4a. SDK</span> pauses stream → executes your tool's execute() function
+   <span class="ap">4b. Tool result</span> is appended to messages → Claude called again (a new "step")
+   <span class="ap">4c. Claude</span> now responds with text, using the tool's output
+
+<span class="ag">5. toDataStreamResponse()</span> converts the stream → chunked HTTP response
+   Each chunk is a text delta prefixed with a type code:
+   <span class="aa">0:"Hello"</span>   ← text delta
+   <span class="aa">9:{...}</span>    ← tool call
+   <span class="aa">a:{...}</span>    ← tool result
+
+<span class="ah">6. useChat</span> on the client reads chunks → updates messages[] state live
+    </div>
+
+    <p>
+      The key insight is that <code>maxSteps: 5</code> means Claude can call up to 5 tools
+      in sequence within one user turn. Each tool call + result pair counts as one step.
+    </p>
+
+    <h3>Step 1 — The Route Handler</h3>
+
+    <p>
+      Create <code>src/app/api/chat/route.ts</code>. This is a standard Next.js Route Handler
+      (App Router). The only special thing is <code>export const runtime = 'nodejs'</code> —
+      without this, Next.js defaults to the Edge runtime which doesn't support Node.js APIs
+      like the stdio transport our MCP client needs.
+    </p>
 
     <div class="code-block">
       <div class="code-header">
@@ -1010,51 +1210,173 @@ server.<span class="fn">tool</span>(
 <span class="kw">import</span> { z } <span class="kw">from</span> <span class="str">'zod'</span>
 <span class="kw">import</span> { <span class="fn">getMcpClient</span> } <span class="kw">from</span> <span class="str">'@/lib/mcp-client'</span>
 
-<span class="kw">export const</span> runtime = <span class="str">'nodejs'</span>  <span class="cm">// not 'edge' — MCP uses stdio</span>
+<span class="cm">// Force Node.js runtime — required for MCP stdio transport</span>
+<span class="kw">export const</span> runtime = <span class="str">'nodejs'</span>
 
 <span class="kw">export async function</span> <span class="fn">POST</span>(req: <span class="imp">Request</span>) {
+  <span class="cm">// useChat sends the full conversation history on every request.
+  // This is how LLMs maintain context — there's no server-side session.</span>
   <span class="kw">const</span> { messages } = <span class="kw">await</span> req.<span class="fn">json</span>()
-  <span class="kw">const</span> mcp = <span class="kw">await</span> <span class="fn">getMcpClient</span>()
 
-  <span class="cm">// Pull available tools from the MCP server dynamically</span>
-  <span class="kw">const</span> mcpTools = <span class="kw">await</span> mcp.<span class="fn">listTools</span>()
+  <span class="kw">const</span> mcp = <span class="kw">await</span> <span class="fn">getMcpClient</span>()
 
   <span class="kw">const</span> result = <span class="kw">await</span> <span class="fn">streamText</span>({
     model: <span class="fn">anthropic</span>(<span class="str">'claude-sonnet-4-20250514'</span>),
-    system: <span class="str">`You are a career coach helping developers understand their skill gaps.
-Use the search_jobs tool to find relevant postings, then analyze_skill_gap 
-to give personalized advice. Be specific and encouraging.`</span>,
+
+    <span class="cm">// The system prompt shapes Claude's entire persona for this session.
+    // Be explicit about which tools exist and when to use them.</span>
+    system: <span class="str">`You are a career coach specialising in tech roles. Help developers
+understand their skill gaps relative to job postings in our database.
+
+Workflow:
+1. When a user describes their background or asks about a role, call search_jobs
+   to find 3-5 relevant postings from the database.
+2. For each interesting result, call analyze_skill_gap with the job_id and the
+   candidate's skills (inferred from what they told you).
+3. Summarise: what they already have, what's missing, and concrete next steps.
+
+Be honest but encouraging. Prioritise actionable advice over exhaustive lists.`</span>,
+
     messages,
+
     tools: {
+      <span class="cm">// Each tool needs: description (helps Claude decide when to use it),
+      // parameters (Zod schema — validates Claude's output AND gives Claude
+      // the shape it must fill in), and execute (runs server-side).</span>
+
       search_jobs: <span class="fn">tool</span>({
-        description: <span class="str">'Search job postings semantically'</span>,
-        parameters: z.<span class="fn">object</span>({ query: z.<span class="fn">string</span>(), limit: z.<span class="fn">number</span>().<span class="fn">optional</span>() }),
+        description: <span class="str">'Semantically search the job postings database. Use natural language — "senior react engineer fintech" works better than keywords.'</span>,
+        parameters: z.<span class="fn">object</span>({
+          query: z.<span class="fn">string</span>().<span class="fn">describe</span>(<span class="str">'Natural language description of the role or skills to search for'</span>),
+          limit: z.<span class="fn">number</span>().<span class="fn">min</span>(<span class="num">1</span>).<span class="fn">max</span>(<span class="num">10</span>).<span class="fn">default</span>(<span class="num">5</span>).<span class="fn">describe</span>(<span class="str">'Number of results to return'</span>),
+        }),
         <span class="kw">async</span> <span class="fn">execute</span>({ query, limit }) {
-          <span class="cm">// Bridge AI SDK tool call → MCP server</span>
-          <span class="kw">const</span> res = <span class="kw">await</span> mcp.<span class="fn">callTool</span>({ name: <span class="str">'search_jobs'</span>, arguments: { query, limit } })
+          <span class="cm">// Bridge: AI SDK tool call → MCP server → pgvector search</span>
+          <span class="kw">const</span> res = <span class="kw">await</span> mcp.<span class="fn">callTool</span>({
+            name: <span class="str">'search_jobs'</span>,
+            arguments: { query, limit },
+          })
+          <span class="cm">// MCP returns content blocks; we only use the first text block</span>
           <span class="kw">return</span> <span class="imp">JSON</span>.<span class="fn">parse</span>((res.content[<span class="num">0</span>] <span class="kw">as</span> <span class="kw">any</span>).text)
         },
       }),
+
       analyze_skill_gap: <span class="fn">tool</span>({
-        description: <span class="str">'Compare candidate skills to a job posting'</span>,
+        description: <span class="str">'Compare a candidate\'s skills against a specific job posting to find matches and gaps.'</span>,
         parameters: z.<span class="fn">object</span>({
-          job_id: z.<span class="fn">number</span>(),
-          candidate_skills: z.<span class="fn">array</span>(z.<span class="fn">string</span>()),
+          job_id: z.<span class="fn">number</span>().<span class="fn">describe</span>(<span class="str">'The job ID from a search_jobs result'</span>),
+          candidate_skills: z.<span class="fn">array</span>(z.<span class="fn">string</span>()).<span class="fn">describe</span>(
+            <span class="str">'Skills the candidate has, inferred from their message. Use concise lowercase tags: ["react","typescript","docker"]'</span>
+          ),
         }),
-        <span class="kw">async</span> <span class="fn">execute</span>(args) {
-          <span class="kw">const</span> res = <span class="kw">await</span> mcp.<span class="fn">callTool</span>({ name: <span class="str">'analyze_skill_gap'</span>, arguments: args })
+        <span class="kw">async</span> <span class="fn">execute</span>({ job_id, candidate_skills }) {
+          <span class="kw">const</span> res = <span class="kw">await</span> mcp.<span class="fn">callTool</span>({
+            name: <span class="str">'analyze_skill_gap'</span>,
+            arguments: { job_id, candidate_skills },
+          })
           <span class="kw">return</span> <span class="imp">JSON</span>.<span class="fn">parse</span>((res.content[<span class="num">0</span>] <span class="kw">as</span> <span class="kw">any</span>).text)
         },
       }),
     },
-    maxSteps: <span class="num">5</span>,  <span class="cm">// allow multi-tool-call chains</span>
+
+    <span class="cm">// maxSteps: how many tool-call rounds Claude can do in one user turn.
+    // Steps: user message → (tool call → tool result) × N → final text reply
+    // Set too low and Claude can't finish complex analysis; too high and costs spike.</span>
+    maxSteps: <span class="num">5</span>,
+
+    <span class="cm">// onStepFinish fires after each tool-call round — useful for logging</span>
+    <span class="fn">onStepFinish</span>({ stepType, toolCalls, toolResults, usage }) {
+      <span class="fn">console</span>.<span class="fn">log</span>(<span class="str">`Step: </span><span class="acc">${stepType}</span><span class="str"> | Tools called: </span><span class="acc">${toolCalls?.length ?? 0}</span><span class="str"> | Tokens: </span><span class="acc">${usage?.totalTokens}</span><span class="str">`</span>)
+    },
   })
 
+  <span class="cm">// toDataStreamResponse() converts the AsyncIterable stream from streamText
+  // into a chunked HTTP response the client's useChat hook understands.</span>
   <span class="kw">return</span> result.<span class="fn">toDataStreamResponse</span>()
 }</code></pre>
     </div>
 
-    <h3>The Chat UI (client-side)</h3>
+    <h3>Step 2 — Build the ChatInterface component</h3>
+
+    <p>
+      Now the fun part. The <code>useChat</code> hook manages everything: sending messages,
+      accumulating streamed text, and tracking the status of in-flight tool calls. Let's build
+      it up piece by piece so you understand what each part does.
+    </p>
+
+    <h3>2a — What <code>useChat</code> gives you</h3>
+
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-lang"><span class="code-dot amber"></span>typescript</div>
+        <span>understanding useChat's return values</span>
+      </div>
+      <pre><code><span class="kw">const</span> {
+  messages,           <span class="cm">// Message[] — the full conversation history</span>
+                      <span class="cm">//   message.role: 'user' | 'assistant'</span>
+                      <span class="cm">//   message.content: string (the visible text)</span>
+                      <span class="cm">//   message.toolInvocations: array of tool calls + results</span>
+
+  input,              <span class="cm">// string — the controlled input value</span>
+  handleInputChange,  <span class="cm">// React.ChangeEventHandler — wire to &lt;input onChange&gt;</span>
+  handleSubmit,       <span class="cm">// React.FormEventHandler — wire to &lt;form onSubmit&gt;</span>
+
+  isLoading,          <span class="cm">// boolean — true while waiting for any response chunk</span>
+  error,              <span class="cm">// Error | undefined — set if the request fails</span>
+  stop,               <span class="cm">// () => void — cancel the in-flight stream</span>
+  reload,             <span class="cm">// () => void — re-send the last user message</span>
+  setMessages,        <span class="cm">// manually override the messages array</span>
+} = <span class="fn">useChat</span>({ api: <span class="str">'/api/chat'</span> })</code></pre>
+    </div>
+
+    <h3>2b — Understanding the message shape</h3>
+
+    <p>
+      Each item in <code>messages[]</code> has a <code>toolInvocations</code> array that grows
+      in real time as Claude calls tools and results come back. Each invocation moves through
+      three states you need to handle:
+    </p>
+
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-lang"><span class="code-dot amber"></span>typescript</div>
+        <span>toolInvocations state progression</span>
+      </div>
+      <pre><code><span class="cm">// State 1: Claude has decided to call a tool but execute() hasn't run yet</span>
+{
+  state: <span class="str">'call'</span>,
+  toolCallId: <span class="str">'call_abc123'</span>,
+  toolName: <span class="str">'search_jobs'</span>,
+  args: { query: <span class="str">'senior react fintech'</span>, limit: <span class="num">3</span> }
+}
+
+<span class="cm">// State 2: execute() is running on the server — show a spinner</span>
+{
+  state: <span class="str">'partial-call'</span>,  <span class="cm">// args may still be streaming in</span>
+  toolCallId: <span class="str">'call_abc123'</span>,
+  toolName: <span class="str">'search_jobs'</span>,
+  args: { query: <span class="str">'senior react'</span> }  <span class="cm">// args incomplete</span>
+}
+
+<span class="cm">// State 3: execute() returned, result sent back to Claude</span>
+{
+  state: <span class="str">'result'</span>,
+  toolCallId: <span class="str">'call_abc123'</span>,
+  toolName: <span class="str">'search_jobs'</span>,
+  args: { query: <span class="str">'senior react fintech'</span>, limit: <span class="num">3</span> },
+  result: [
+    { id: <span class="num">7</span>, title: <span class="str">'Senior React Engineer'</span>, company: <span class="str">'FinCo'</span>, similarity: <span class="num">0.91</span> },
+    <span class="cm">// ...</span>
+  ]
+}</code></pre>
+    </div>
+
+    <h3>2c — The full component</h3>
+
+    <p>
+      Now we can write a component that handles all three states, renders streaming text properly,
+      shows tool calls with collapsible result panels, and includes proper loading and error states.
+    </p>
 
     <div class="code-block">
       <div class="code-header">
@@ -1064,47 +1386,310 @@ to give personalized advice. Be specific and encouraging.`</span>,
       <pre><code><span class="str">'use client'</span>
 
 <span class="kw">import</span> { <span class="fn">useChat</span> } <span class="kw">from</span> <span class="str">'ai/react'</span>
+<span class="kw">import</span> { <span class="fn">useEffect</span>, <span class="fn">useRef</span>, <span class="fn">useState</span> } <span class="kw">from</span> <span class="str">'react'</span>
+<span class="kw">import type</span> { <span class="imp">Message</span>, <span class="imp">ToolInvocation</span> } <span class="kw">from</span> <span class="str">'ai'</span>
 
-<span class="kw">export function</span> <span class="fn">ChatInterface</span>() {
-  <span class="kw">const</span> { messages, input, <span class="fn">handleInputChange</span>, <span class="fn">handleSubmit</span>, isLoading } = <span class="fn">useChat</span>({
-    api: <span class="str">'/api/chat'</span>,
-  })
+<span class="cm">// ── Sub-component: renders a single tool call + its result ──────────</span>
+<span class="kw">function</span> <span class="fn">ToolCallPanel</span>({ invocation }: { invocation: <span class="imp">ToolInvocation</span> }) {
+  <span class="kw">const</span> [open, <span class="fn">setOpen</span>] = <span class="fn">useState</span>(<span class="kw">false</span>)
+
+  <span class="cm">// Map tool names to readable labels and colours</span>
+  <span class="kw">const</span> meta: <span class="imp">Record</span>&lt;<span class="imp">string</span>, { label: <span class="imp">string</span>; colour: <span class="imp">string</span> }&gt; = {
+    search_jobs:       { label: <span class="str">'🔍 Searching jobs'</span>,       colour: <span class="str">'#00d4ff'</span> },
+    analyze_skill_gap: { label: <span class="str">'📊 Analysing skill gap'</span>,  colour: <span class="str">'#10b981'</span> },
+    get_trending_skills: { label: <span class="str">'📈 Fetching trends'</span>,    colour: <span class="str">'#f59e0b'</span> },
+  }
+  <span class="kw">const</span> { label, colour } = meta[invocation.toolName] ?? {
+    label: invocation.toolName, colour: <span class="str">'#6b7f96'</span>
+  }
+
+  <span class="kw">const</span> isPending = invocation.state !== <span class="str">'result'</span>
 
   <span class="kw">return</span> (
-    &lt;<span class="acc">div</span> className=<span class="str">"flex flex-col h-screen max-w-2xl mx-auto"</span>&gt;
-      &lt;<span class="acc">div</span> className=<span class="str">"flex-1 overflow-y-auto p-4 space-y-4"</span>&gt;
-        {messages.<span class="fn">map</span>(m => (
-          &lt;<span class="acc">div</span> key={m.id} className={<span class="str">`p-3 rounded-lg </span><span class="acc">${</span>
-            m.role === <span class="str">'user'</span> ? <span class="str">'bg-blue-50 ml-8'</span> : <span class="str">'bg-gray-50 mr-8'</span>
-          <span class="acc">}</span><span class="str">`</span>}&gt;
-            &lt;<span class="acc">p</span> className=<span class="str">"text-xs text-gray-500 mb-1"</span>&gt;{m.role}&lt;/<span class="acc">p</span>&gt;
-            &lt;<span class="acc">p</span>&gt;{m.content}&lt;/<span class="acc">p</span>&gt;
-          &lt;/<span class="acc">div</span>&gt;
+    &lt;<span class="acc">div</span> style={{
+      border: <span class="str">`1px solid </span><span class="acc">${colour}</span><span class="str">33`</span>,
+      borderLeft: <span class="str">`3px solid </span><span class="acc">${colour}</span>`,
+      borderRadius: <span class="str">'0 6px 6px 0'</span>,
+      background: <span class="str">'rgba(0,0,0,0.2)'</span>,
+      margin: <span class="str">'6px 0'</span>,
+      fontSize: <span class="str">'12px'</span>,
+      fontFamily: <span class="str">'monospace'</span>,
+    }}&gt;
+      {<span class="cm">/* Header row — always visible */</span>}
+      &lt;<span class="acc">button</span>
+        onClick={() =&gt; !isPending &amp;&amp; <span class="fn">setOpen</span>(o =&gt; !o)}
+        style={{
+          width: <span class="str">'100%'</span>, textAlign: <span class="str">'left'</span>, padding: <span class="str">'8px 12px'</span>,
+          background: <span class="str">'none'</span>, border: <span class="str">'none'</span>, cursor: isPending ? <span class="str">'default'</span> : <span class="str">'pointer'</span>,
+          display: <span class="str">'flex'</span>, alignItems: <span class="str">'center'</span>, gap: <span class="str">'8px'</span>, color: colour,
+        }}
+      &gt;
+        {isPending
+          ? &lt;<span class="acc">span</span> style={{ animation: <span class="str">'spin 1s linear infinite'</span> }}&gt;⟳&lt;/<span class="acc">span</span>&gt;
+          : &lt;<span class="acc">span</span>&gt;{open ? <span class="str">'▾'</span> : <span class="str">'▸'</span>}&lt;/<span class="acc">span</span>&gt;
+        }
+        &lt;<span class="acc">span</span>&gt;{label}&lt;/<span class="acc">span</span>&gt;
+        {isPending &amp;&amp; &lt;<span class="acc">span</span> style={{ color: <span class="str">'#4a6078'</span>, fontSize: <span class="str">'11px'</span> }}&gt;running...&lt;/<span class="acc">span</span>&gt;}
+        {!isPending &amp;&amp; &lt;<span class="acc">span</span> style={{ color: <span class="str">'#4a6078'</span>, fontSize: <span class="str">'11px'</span>, marginLeft: <span class="str">'auto'</span> }}&gt;
+          click to {open ? <span class="str">'collapse'</span> : <span class="str">'expand'</span>}
+        &lt;/<span class="acc">span</span>&gt;}
+      &lt;/<span class="acc">button</span>&gt;
+
+      {<span class="cm">/* Collapsed detail — inputs + result */</span>}
+      {open &amp;&amp; invocation.state === <span class="str">'result'</span> &amp;&amp; (
+        &lt;<span class="acc">div</span> style={{ padding: <span class="str">'0 12px 12px'</span>, borderTop: <span class="str">'1px solid #1a2332'</span> }}&gt;
+          &lt;<span class="acc">p</span> style={{ color: <span class="str">'#4a6078'</span>, margin: <span class="str">'8px 0 4px'</span> }}&gt;Input:&lt;/<span class="acc">p</span>&gt;
+          &lt;<span class="acc">pre</span> style={{ color: <span class="str">'#7a9ab8'</span>, overflowX: <span class="str">'auto'</span>, margin: <span class="num">0</span> }}&gt;
+            {<span class="imp">JSON</span>.<span class="fn">stringify</span>(invocation.args, <span class="kw">null</span>, <span class="num">2</span>)}
+          &lt;/<span class="acc">pre</span>&gt;
+          &lt;<span class="acc">p</span> style={{ color: <span class="str">'#4a6078'</span>, margin: <span class="str">'8px 0 4px'</span> }}&gt;Result:&lt;/<span class="acc">p</span>&gt;
+          &lt;<span class="acc">pre</span> style={{ color: <span class="str">'#7a9ab8'</span>, overflowX: <span class="str">'auto'</span>, margin: <span class="num">0</span> }}&gt;
+            {<span class="imp">JSON</span>.<span class="fn">stringify</span>(invocation.result, <span class="kw">null</span>, <span class="num">2</span>)}
+          &lt;/<span class="acc">pre</span>&gt;
+        &lt;/<span class="acc">div</span>&gt;
+      )}
+    &lt;/<span class="acc">div</span>&gt;
+  )
+}
+
+<span class="cm">// ── Sub-component: renders one message bubble ───────────────────────</span>
+<span class="kw">function</span> <span class="fn">MessageBubble</span>({ message }: { message: <span class="imp">Message</span> }) {
+  <span class="kw">const</span> isUser = message.role === <span class="str">'user'</span>
+
+  <span class="kw">return</span> (
+    &lt;<span class="acc">div</span> style={{
+      display: <span class="str">'flex'</span>,
+      flexDirection: <span class="str">'column'</span>,
+      alignItems: isUser ? <span class="str">'flex-end'</span> : <span class="str">'flex-start'</span>,
+      gap: <span class="str">'4px'</span>,
+    }}&gt;
+      {<span class="cm">/* Tool calls appear BEFORE the assistant's text reply */</span>}
+      {!isUser &amp;&amp; message.toolInvocations?.map(inv =&gt; (
+        &lt;<span class="imp">ToolCallPanel</span> key={inv.toolCallId} invocation={inv} /&gt;
+      ))}
+
+      {<span class="cm">/* The actual message text — only render if non-empty
+           (assistant messages with only tool calls have empty content) */</span>}
+      {message.content &amp;&amp; (
+        &lt;<span class="acc">div</span> style={{
+          maxWidth: <span class="str">'85%'</span>,
+          padding: <span class="str">'10px 14px'</span>,
+          borderRadius: isUser ? <span class="str">'12px 12px 2px 12px'</span> : <span class="str">'12px 12px 12px 2px'</span>,
+          background: isUser ? <span class="str">'rgba(0,212,255,0.12)'</span> : <span class="str">'rgba(255,255,255,0.04)'</span>,
+          border: isUser ? <span class="str">'1px solid rgba(0,212,255,0.2)'</span> : <span class="str">'1px solid #1e2733'</span>,
+          color: <span class="str">'#c9d4e0'</span>,
+          fontSize: <span class="str">'14px'</span>,
+          lineHeight: <span class="str">'1.6'</span>,
+          whiteSpace: <span class="str">'pre-wrap'</span>,   <span class="cm">// preserve newlines in Claude's response</span>
+        }}&gt;
+          {message.content}
+        &lt;/<span class="acc">div</span>&gt;
+      )}
+    &lt;/<span class="acc">div</span>&gt;
+  )
+}
+
+<span class="cm">// ── Main component ──────────────────────────────────────────────────</span>
+<span class="kw">export function</span> <span class="fn">ChatInterface</span>() {
+  <span class="kw">const</span> bottomRef = <span class="fn">useRef</span>&lt;<span class="imp">HTMLDivElement</span>&gt;(<span class="kw">null</span>)
+
+  <span class="kw">const</span> {
+    messages,
+    input,
+    <span class="fn">handleInputChange</span>,
+    <span class="fn">handleSubmit</span>,
+    isLoading,
+    error,
+    stop,
+    reload,
+  } = <span class="fn">useChat</span>({
+    api: <span class="str">'/api/chat'</span>,
+
+    <span class="cm">// onError fires if the POST itself fails (network error, 5xx, etc.)
+    // Distinguish from tool errors which come back as normal messages.</span>
+    <span class="fn">onError</span>(err) {
+      <span class="fn">console</span>.<span class="fn">error</span>(<span class="str">'Chat error:'</span>, err)
+    },
+  })
+
+  <span class="cm">// Auto-scroll to the newest message whenever messages update</span>
+  <span class="fn">useEffect</span>(() =&gt; {
+    bottomRef.current?.<span class="fn">scrollIntoView</span>({ behavior: <span class="str">'smooth'</span> })
+  }, [messages])
+
+  <span class="kw">return</span> (
+    &lt;<span class="acc">div</span> style={{ display: <span class="str">'flex'</span>, flexDirection: <span class="str">'column'</span>, height: <span class="str">'100vh'</span>, maxWidth: <span class="str">'720px'</span>, margin: <span class="str">'0 auto'</span> }}&gt;
+
+      {<span class="cm">/* ── Message list ── */</span>}
+      &lt;<span class="acc">div</span> style={{ flex: <span class="num">1</span>, overflowY: <span class="str">'auto'</span>, padding: <span class="str">'24px 16px'</span>, display: <span class="str">'flex'</span>, flexDirection: <span class="str">'column'</span>, gap: <span class="str">'16px'</span> }}&gt;
+
+        {messages.length === <span class="num">0</span> &amp;&amp; (
+          &lt;<span class="acc">p</span> style={{ color: <span class="str">'#4a6078'</span>, textAlign: <span class="str">'center'</span>, marginTop: <span class="str">'80px'</span> }}&gt;
+            Describe your skills or paste a job description to get started.
+          &lt;/<span class="acc">p</span>&gt;
+        )}
+
+        {messages.<span class="fn">map</span>(m =&gt; (
+          &lt;<span class="imp">MessageBubble</span> key={m.id} message={m} /&gt;
         ))}
-        {isLoading &amp;&amp; &lt;<span class="acc">div</span> className=<span class="str">"animate-pulse"</span>&gt;Thinking...&lt;/<span class="acc">div</span>&gt;}
+
+        {<span class="cm">/* Typing indicator — shown while stream is open but no text yet */</span>}
+        {isLoading &amp;&amp; messages[messages.length - <span class="num">1</span>]?.role !== <span class="str">'assistant'</span> &amp;&amp; (
+          &lt;<span class="acc">div</span> style={{ display: <span class="str">'flex'</span>, gap: <span class="str">'4px'</span>, padding: <span class="str">'10px 14px'</span> }}&gt;
+            {[<span class="num">0</span>,<span class="num">1</span>,<span class="num">2</span>].<span class="fn">map</span>(i =&gt; (
+              &lt;<span class="acc">span</span> key={i} style={{
+                width: <span class="str">'6px'</span>, height: <span class="str">'6px'</span>, borderRadius: <span class="str">'50%'</span>,
+                background: <span class="str">'#4a6078'</span>,
+                animation: <span class="str">`pulse 1.2s ease-in-out </span><span class="acc">${i * 0.2}</span><span class="str">s infinite`</span>,
+              }} /&gt;
+            ))}
+          &lt;/<span class="acc">div</span>&gt;
+        )}
+
+        {<span class="cm">/* Error state — network or API failure */</span>}
+        {error &amp;&amp; (
+          &lt;<span class="acc">div</span> style={{ color: <span class="str">'#f87171'</span>, fontSize: <span class="str">'13px'</span>, padding: <span class="str">'8px'</span> }}&gt;
+            Error: {error.message}.{<span class="str">' '</span>}
+            &lt;<span class="acc">button</span> onClick={reload} style={{ color: <span class="str">'#00d4ff'</span>, background: <span class="str">'none'</span>, border: <span class="str">'none'</span>, cursor: <span class="str">'pointer'</span> }}&gt;
+              Retry
+            &lt;/<span class="acc">button</span>&gt;
+          &lt;/<span class="acc">div</span>&gt;
+        )}
+
+        &lt;<span class="acc">div</span> ref={bottomRef} /&gt;
       &lt;/<span class="acc">div</span>&gt;
 
-      &lt;<span class="acc">form</span> <span class="fn">onSubmit</span>={handleSubmit} className=<span class="str">"p-4 border-t flex gap-2"</span>&gt;
-        &lt;<span class="acc">input</span>
+      {<span class="cm">/* ── Input bar ── */</span>}
+      &lt;<span class="acc">form</span>
+        onSubmit={handleSubmit}
+        style={{ borderTop: <span class="str">'1px solid #1e2733'</span>, padding: <span class="str">'12px 16px'</span>, display: <span class="str">'flex'</span>, gap: <span class="str">'8px'</span> }}
+      &gt;
+        &lt;<span class="acc">textarea</span>
           value={input}
-          <span class="fn">onChange</span>={handleInputChange}
-          placeholder=<span class="str">"Describe your skills or paste a job description..."</span>
-          className=<span class="str">"flex-1 border rounded px-3 py-2"</span>
+          onChange={handleInputChange}
+          placeholder=<span class="str">"I know React, TypeScript, and some Node.js — what am I missing for senior roles?"</span>
+          rows={<span class="num">2</span>}
+          style={{
+            flex: <span class="num">1</span>, background: <span class="str">'#0f1318'</span>, border: <span class="str">'1px solid #1e2733'</span>,
+            borderRadius: <span class="str">'6px'</span>, color: <span class="str">'#c9d4e0'</span>, padding: <span class="str">'8px 12px'</span>,
+            resize: <span class="str">'none'</span>, fontFamily: <span class="str">'inherit'</span>, fontSize: <span class="str">'14px'</span>,
+          }}
+          <span class="cm">// Submit on Enter, new line on Shift+Enter</span>
+          onKeyDown={e =&gt; {
+            <span class="kw">if</span> (e.key === <span class="str">'Enter'</span> &amp;&amp; !e.shiftKey) {
+              e.<span class="fn">preventDefault</span>()
+              <span class="fn">handleSubmit</span>(e <span class="kw">as</span> <span class="kw">any</span>)
+            }
+          }}
         /&gt;
-        &lt;<span class="acc">button</span> type=<span class="str">"submit"</span>&gt;Analyze&lt;/<span class="acc">button</span>&gt;
+
+        {isLoading
+          ? &lt;<span class="acc">button</span> type=<span class="str">"button"</span> onClick={stop}
+              style={{ background: <span class="str">'#1e2733'</span>, border: <span class="str">'none'</span>, borderRadius: <span class="str">'6px'</span>, padding: <span class="str">'0 16px'</span>, color: <span class="str">'#f87171'</span>, cursor: <span class="str">'pointer'</span> }}&gt;
+              Stop
+            &lt;/<span class="acc">button</span>&gt;
+          : &lt;<span class="acc">button</span> type=<span class="str">"submit"</span> disabled={!input.trim()}
+              style={{ background: <span class="str">'#00d4ff'</span>, border: <span class="str">'none'</span>, borderRadius: <span class="str">'6px'</span>, padding: <span class="str">'0 16px'</span>, color: <span class="str">'#000'</span>, cursor: <span class="str">'pointer'</span>, fontWeight: <span class="str">'600'</span>, opacity: input.trim() ? <span class="num">1</span> : <span class="num">0.4</span> }}&gt;
+              Send
+            &lt;/<span class="acc">button</span>&gt;
+        }
       &lt;/<span class="acc">form</span>&gt;
     &lt;/<span class="acc">div</span>&gt;
   )
 }</code></pre>
     </div>
 
+    <h3>Step 3 — Wire it into the page</h3>
+
+    <p>
+      The <code>ChatInterface</code> is a client component sitting inside a server component.
+      This is the App Router "client island" pattern — the server component fetches data and
+      passes it as props; the client component handles all interactivity.
+    </p>
+
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-lang"><span class="code-dot amber"></span>typescript</div>
+        <span>src/app/page.tsx</span>
+      </div>
+      <pre><code><span class="cm">// No 'use client' — this component runs on the server</span>
+<span class="kw">import</span> { <span class="fn">getRecentJobs</span> } <span class="kw">from</span> <span class="str">'@/lib/db'</span>
+<span class="kw">import</span> { <span class="fn">ChatInterface</span> } <span class="kw">from</span> <span class="str">'@/components/ChatInterface'</span>
+
+<span class="kw">export default async function</span> <span class="fn">Home</span>() {
+  <span class="cm">// This runs on the server — direct DB call, no API needed</span>
+  <span class="kw">const</span> jobCount = (<span class="kw">await</span> <span class="fn">getRecentJobs</span>(<span class="num">1000</span>)).length
+
+  <span class="kw">return</span> (
+    &lt;<span class="acc">main</span> style={{ minHeight: <span class="str">'100vh'</span>, background: <span class="str">'#0a0c10'</span> }}&gt;
+      &lt;<span class="acc">header</span> style={{ padding: <span class="str">'20px 24px'</span>, borderBottom: <span class="str">'1px solid #1e2733'</span> }}&gt;
+        &lt;<span class="acc">h1</span> style={{ color: <span class="str">'#eaf0f8'</span> }}&gt;Dev Skill Radar&lt;/<span class="acc">h1</span>&gt;
+        &lt;<span class="acc">p</span> style={{ color: <span class="str">'#6b7f96'</span>, fontSize: <span class="str">'13px'</span> }}&gt;
+          {jobCount} job postings indexed
+        &lt;/<span class="acc">p</span>&gt;
+      &lt;/<span class="acc">header</span>&gt;
+
+      {<span class="cm">/* Client boundary: everything inside ChatInterface runs in the browser */</span>}
+      &lt;<span class="imp">ChatInterface</span> /&gt;
+    &lt;/<span class="acc">main</span>&gt;
+  )
+}</code></pre>
+    </div>
+
+    <h3>Step 4 — Test it locally</h3>
+
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-lang"><span class="code-dot"></span>bash</div>
+        <span>terminal</span>
+      </div>
+      <pre><code><span class="cm"># Make sure Postgres is running (from Phase 2)</span>
+docker compose up postgres -d
+
+<span class="cm"># Start Next.js dev server</span>
+npm run dev
+
+<span class="cm"># Open http://localhost:3000 and try a message like:
+# "I know React and TypeScript. What do I need to land a senior role at a fintech?"
+# 
+# You should see:
+# 1. The ToolCallPanel appear with "Searching jobs..." spinner
+# 2. A second panel "Analysing skill gap..."
+# 3. Claude's text response streaming in word by word</span></code></pre>
+    </div>
+
+    <div class="callout warn">
+      <span class="callout-icon">⚠</span>
+      <div class="callout-body">
+        <p>
+          If tool calls never appear and Claude just answers without searching, check that your
+          <code>system</code> prompt explicitly tells Claude to use the tools, and that the tool
+          <code>description</code> fields clearly explain when they're appropriate. Claude relies
+          heavily on descriptions to decide when to call a tool.
+        </p>
+      </div>
+    </div>
+
+    <div class="callout tip">
+      <span class="callout-icon">✦</span>
+      <div class="callout-body">
+        <p>
+          Open the Network tab in DevTools and click the <code>/api/chat</code> request. Switch
+          to the Response tab and watch the chunks arrive. You'll see the type-prefixed protocol
+          the AI SDK uses: <code>0:"word"</code> for text deltas, <code>9:{...}</code> for tool calls.
+          Understanding this makes debugging streaming issues much easier.
+        </p>
+      </div>
+    </div>
+
     <div class="claude-prompt">
       <div class="claude-prompt-header">Claude Code Prompt</div>
       <p>
-        Enhance ChatInterface.tsx to display tool invocations as collapsible UI elements. 
-        When Claude calls search_jobs or analyze_skill_gap, show a small expandable panel 
-        below the message with the tool name, inputs, and a formatted JSON output. Use the 
-        AI SDK's toolInvocations property on messages to get this data.
+        Add a SkillGapReport component that renders after Claude's final message when it
+        contains skill analysis. Parse Claude's response for lines containing "Missing:" or
+        "You have:" and render them as a visual two-column grid — left column "Skills You Have"
+        with green checkmarks, right column "Skills to Develop" with amber dots and a link to
+        a learning resource for each. Keep it as a child of ChatInterface.
       </p>
     </div>
 
@@ -1252,10 +1837,44 @@ id = <span class="str">"your-kv-namespace-id"</span></code></pre>
       <strong>container</strong> is a running instance of that image.
     </p>
 
-    <h3>Multi-stage Dockerfile</h3>
+    <h3>Step 1 — Enable Next.js standalone output</h3>
+
     <p>
-      Multi-stage builds keep the final image lean — build tools stay in the build stage 
-      and never end up in production.
+      The Dockerfile's runner stage copies <code>.next/standalone</code> — but this only exists
+      if you tell Next.js to produce it. Add this to <code>next.config.ts</code> first, or the
+      Docker build will fail silently with a missing file error.
+    </p>
+
+    <div class="code-block">
+      <div class="code-header">
+        <div class="code-lang"><span class="code-dot red"></span>typescript</div>
+        <span>next.config.ts</span>
+      </div>
+      <pre><code><span class="kw">import type</span> { <span class="imp">NextConfig</span> } <span class="kw">from</span> <span class="str">'next'</span>
+
+<span class="kw">const</span> config: <span class="imp">NextConfig</span> = {
+  <span class="cm">// Produces a self-contained output in .next/standalone/
+  // The standalone folder includes only the files needed to run the server,
+  // not node_modules — resulting in much smaller Docker images.</span>
+  output: <span class="str">'standalone'</span>,
+
+  <span class="cm">// Disable the linting step during build (CI should run lint separately)</span>
+  eslint: { ignoreDuringBuilds: <span class="kw">true</span> },
+
+  <span class="cm">// Optional: avoid bundling pg (it has native bindings that confuse bundlers)</span>
+  serverExternalPackages: [<span class="str">'pg'</span>, <span class="str">'pg-native'</span>],
+}
+
+<span class="kw">export default</span> config</code></pre>
+    </div>
+
+    <h3>Step 2 — Write the Dockerfile</h3>
+
+    <p>
+      Multi-stage builds keep the final image small. The <code>deps</code> stage installs
+      packages; the <code>builder</code> stage compiles TypeScript and builds Next.js;
+      the <code>runner</code> stage is the only one that ends up in the final image — and
+      it only contains what's needed to run, not build.
     </p>
 
     <div class="code-block">
@@ -1266,32 +1885,54 @@ id = <span class="str">"your-kv-namespace-id"</span></code></pre>
       <pre><code><span class="cm"># ── Stage 1: Install dependencies ──────────────────────</span>
 <span class="key">FROM</span> node:<span class="num">20</span>-alpine <span class="key">AS</span> deps
 <span class="key">WORKDIR</span> /app
+
+<span class="cm"># Install libc compat for native modules on alpine</span>
+<span class="key">RUN</span> apk add --no-cache libc6-compat
+
 <span class="key">COPY</span> package*.json ./
-<span class="key">RUN</span> npm ci --only=production
+<span class="key">RUN</span> npm ci
 
 <span class="cm"># ── Stage 2: Build ──────────────────────────────────────</span>
 <span class="key">FROM</span> node:<span class="num">20</span>-alpine <span class="key">AS</span> builder
 <span class="key">WORKDIR</span> /app
+
 <span class="key">COPY</span> --from=deps /app/node_modules ./node_modules
 <span class="key">COPY</span> . .
+
+<span class="cm"># Build env vars needed at build time (not runtime secrets)</span>
+<span class="key">ENV</span> NEXT_TELEMETRY_DISABLED=1
+
 <span class="key">RUN</span> npm run build
 
-<span class="cm"># ── Stage 3: Production image ───────────────────────────</span>
+<span class="cm"># ── Stage 3: Production runner ──────────────────────────</span>
 <span class="key">FROM</span> node:<span class="num">20</span>-alpine <span class="key">AS</span> runner
 <span class="key">WORKDIR</span> /app
 
 <span class="key">ENV</span> NODE_ENV=production
+<span class="key">ENV</span> NEXT_TELEMETRY_DISABLED=1
 
-<span class="cm"># Only copy what's needed to run</span>
+<span class="cm"># Create a non-root user — important for security</span>
+<span class="key">RUN</span> addgroup --system --gid 1001 nodejs
+<span class="key">RUN</span> adduser --system --uid 1001 nextjs
+
+<span class="cm"># Only the files the server actually needs to run</span>
 <span class="key">COPY</span> --from=builder /app/public ./public
-<span class="key">COPY</span> --from=builder /app/.next/standalone ./
-<span class="key">COPY</span> --from=builder /app/.next/static ./.next/static
+<span class="key">COPY</span> --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+<span class="key">COPY</span> --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+
+<span class="key">USER</span> nextjs
 
 <span class="key">EXPOSE</span> <span class="num">3000</span>
+<span class="key">ENV</span> PORT=3000
+<span class="key">ENV</span> HOSTNAME=<span class="str">"0.0.0.0"</span>
+
+<span class="key">HEALTHCHECK</span> --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  <span class="key">CMD</span> wget -qO- http://localhost:3000/api/health || exit 1
+
 <span class="key">CMD</span> [<span class="str">"node"</span>, <span class="str">"server.js"</span>]</code></pre>
     </div>
 
-    <h3>Docker Compose for local dev</h3>
+    <h3>Step 3 — Docker Compose for local dev</h3>
 
     <div class="code-block">
       <div class="code-header">
@@ -1332,31 +1973,67 @@ volumes:
   pgdata:</code></pre>
     </div>
 
+    <div class="callout info">
+      <span class="callout-icon">ℹ</span>
+      <div class="callout-body">
+        <p>
+          Note that <code>postgres</code> in the <code>DATABASE_URL</code> is the service name,
+          not a hostname. Docker Compose creates a DNS entry for each service name automatically,
+          so containers can reach each other by service name.
+        </p>
+      </div>
+    </div>
+
+    <h3>Step 4 — Build and run</h3>
+
     <div class="code-block">
       <div class="code-header">
         <div class="code-lang"><span class="code-dot"></span>bash</div>
-        <span>terminal — run locally with Docker</span>
+        <span>terminal — full Docker workflow</span>
       </div>
-      <pre><code><span class="cm"># Build and start everything</span>
+      <pre><code><span class="cm"># Build the image and start all services</span>
 docker compose up --build
 
-<span class="cm"># Run DB migrations</span>
-docker compose exec postgres psql -U app skill_radar -f /docker-entrypoint-initdb.d/001_init.sql
+<span class="cm"># First run only: run migrations (the initdb.d mount handles this automatically
+# for Postgres, but run manually if you need to reset)</span>
+docker compose exec postgres psql -U app skill_radar \
+  -f /docker-entrypoint-initdb.d/001_init.sql
 
-<span class="cm"># Seed the database</span>
+<span class="cm"># Seed job data (run from host — executes inside the app container)</span>
 docker compose exec app node -r tsx/register scripts/seed.ts
 
-<span class="cm"># Tail logs</span>
-docker compose logs -f app</code></pre>
+<span class="cm"># Check logs for both services</span>
+docker compose logs -f
+
+<span class="cm"># Check image size (multi-stage should be ~200MB vs ~800MB naive)</span>
+docker images skill-radar
+
+<span class="cm"># Stop everything (volumes preserved)</span>
+docker compose down
+
+<span class="cm"># Stop and wipe database data</span>
+docker compose down -v</code></pre>
+    </div>
+
+    <div class="callout warn">
+      <span class="callout-icon">⚠</span>
+      <div class="callout-body">
+        <p>
+          Never put real <code>ANTHROPIC_API_KEY</code> values in <code>docker-compose.yml</code>
+          — use <code>"${ANTHROPIC_API_KEY}"</code> which reads from your shell environment, or
+          create a <code>.env</code> file that Docker Compose automatically picks up. Add
+          <code>.env</code> to <code>.gitignore</code> immediately.
+        </p>
+      </div>
     </div>
 
     <div class="claude-prompt">
       <div class="claude-prompt-header">Claude Code Prompt</div>
       <p>
-        Add a .dockerignore file that excludes node_modules, .next, .git, *.env*, 
-        and k8s/. Also update the Dockerfile to add a non-root user called "nextjs" 
-        and switch to it before CMD for better container security. Finally, add a 
-        healthcheck instruction that hits localhost:3000/api/health every 30 seconds.
+        Add a .dockerignore file that excludes node_modules, .next, .git, *.env*, coverage/,
+        and k8s/. Also update next.config.ts to set output: 'standalone' and add pg to
+        serverExternalPackages. Then run "docker compose up --build" and tell me if the
+        build succeeds or show me any errors.
       </p>
     </div>
 
