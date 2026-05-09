@@ -1,20 +1,58 @@
 'use client';
 import { useChat } from '@ai-sdk/react';
 import { DefaultChatTransport } from 'ai';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 
 export default function ChatInterface() {
   const [input, setInput] = useState('');
+  const [uploadStatus, setUploadStatus] = useState<'idle' | 'uploading' | 'error'>('idle');
+  const [uploadError, setUploadError] = useState('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
   const { messages, sendMessage, status } = useChat({
     transport: new DefaultChatTransport({ api: '/api/chat' }),
   });
 
   const isLoading = status === 'streaming' || status === 'submitted';
 
+  async function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setUploadStatus('uploading');
+    setUploadError('');
+
+    try {
+      const fd = new FormData();
+      fd.append('resume', file);
+
+      const res = await fetch('/api/upload-resume', { method: 'POST', body: fd });
+      const data = await res.json();
+
+      if (!res.ok) {
+        setUploadStatus('error');
+        setUploadError(data.error ?? 'Upload failed');
+        return;
+      }
+
+      const { skills, summary } = data as { skills: string[]; summary: string };
+      const skillList = skills.join(', ');
+      sendMessage({
+        text: `I've uploaded my resume. ${summary} My skills include: ${skillList}. Based on these skills, what jobs am I best suited for and what skills am I missing for senior roles?`,
+      });
+      setUploadStatus('idle');
+    } catch {
+      setUploadStatus('error');
+      setUploadError('Upload failed — please try again');
+    } finally {
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  }
+
   return (
     <div className="max-w-2xl mx-auto px-5 py-6">
       <h1 className="text-2xl font-bold mb-1">Dev Skill Radar</h1>
-      <p className="text-gray-500 mb-5">Describe your skills and I'll find relevant jobs and skill gaps.</p>
+      <p className="text-gray-500 mb-5">Describe your skills or upload your resume to find relevant jobs and skill gaps.</p>
 
       <div className="border border-gray-200 rounded-lg min-h-[500px] p-4 mb-4">
         {messages.length === 0 && (
@@ -40,13 +78,13 @@ export default function ChatInterface() {
                   if (part.state === 'output-available') {
                     return (
                       <div key={i} className="bg-gray-100 rounded-md px-3 py-2 mt-2 text-[13px] text-gray-500">
-                        🔍 Searched for: <em>{(part.input as any).query}</em>
+                        Searched for: <em>{(part.input as any).query}</em>
                       </div>
                     )
                   }
                   return (
                     <div key={i} className="bg-gray-100 rounded-md px-3 py-2 mt-2 text-[13px] text-gray-500">
-                      🔍 Searching...
+                      Searching...
                     </div>
                   )
                 default:
@@ -61,6 +99,10 @@ export default function ChatInterface() {
         )}
       </div>
 
+      {uploadStatus === 'error' && (
+        <p className="text-red-500 text-sm mb-2">{uploadError}</p>
+      )}
+
       <form
         onSubmit={e => {
           e.preventDefault();
@@ -70,6 +112,22 @@ export default function ChatInterface() {
         }}
         className="flex gap-2"
       >
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".pdf,.txt,application/pdf,text/plain"
+          className="hidden"
+          onChange={handleFileChange}
+        />
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={isLoading || uploadStatus === 'uploading'}
+          title="Upload resume (PDF or TXT)"
+          className="px-3 py-2.5 border border-gray-300 rounded-md text-gray-500 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm"
+        >
+          {uploadStatus === 'uploading' ? 'Parsing...' : 'Upload Resume'}
+        </button>
         <input
           value={input}
           onChange={e => setInput(e.currentTarget.value)}
