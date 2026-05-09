@@ -23,3 +23,10 @@ export async function getJobCount(): Promise<number> {
   const { rows } = await pool.query('SELECT COUNT(*) FROM jobs')
   return parseInt(rows[0].count)
 }
+
+export async function getAllJobs(): Promise<Job[]> {
+  const { rows } = await pool.query(
+    'SELECT id, title, company, description, skills, created_at FROM jobs ORDER BY created_at DESC'
+  )
+  return rows
+}
